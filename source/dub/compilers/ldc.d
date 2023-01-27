@@ -159,7 +159,9 @@ config    /etc/ldc2.conf (x86_64-pc-linux-gnu)
 				 * compiling only, without linking).
 				 * *Pre*pending the flags enables the user to override them.
 				 */
-				settings.prependDFlags("-fvisibility=public", "-dllimport=all");
+				// changed for Symmetry's SIL plugins:
+				//settings.prependDFlags("-fvisibility=public", "-dllimport=all");
+				settings.prependDFlags("-fvisibility=hidden", "-dllimport=defaultLibsOnly");
 			} else {
 				settings.addDFlags("-relocation-model=pic");
 			}
