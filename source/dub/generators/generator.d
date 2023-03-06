@@ -459,6 +459,37 @@ class ProjectGenerator
 		configureDependents(*roottarget, targets);
 		visited.clear();
 
+		// LDC: on Windows, need to pass down dflags affecting symbol visibility
+		if (genSettings.platform.compiler == "ldc" && genSettings.platform.isWindows())
+		{
+			static bool inheritDFlag(string flag)
+			{
+				if (flag.startsWith("--"))
+					flag = flag[1 .. $];
+				return flag.startsWith("-link-defaultlib-shared")
+					|| flag.startsWith("-fvisibility=")
+					|| flag.startsWith("-dllimport=");
+			}
+
+			// all dflags from dependencies have already been added to the root project
+			auto rootDFlagsToInherit = roottarget.buildSettings.dflags.filter!inheritDFlag.array;
+
+			if (rootDFlagsToInherit.length)
+			{
+				foreach (name, ref ti; targets)
+				{
+					if (&ti != roottarget)
+					{
+						import std.range : chain;
+						ti.buildSettings.dflags = ti.buildSettings.dflags
+							.filter!(f => !inheritDFlag(f))
+							.chain(rootDFlagsToInherit)
+							.array;
+					}
+				}
+			}
+		}
+
 		// 4. As an extension to configureDependents we need to copy any injectSourceFiles
 		// in our dependencies (ignoring targetType)
 		void configureDependentsFinalImages(ref TargetInfo ti, TargetInfo[string] targets, ref TargetInfo finalBinaryTarget, size_t level = 0)
