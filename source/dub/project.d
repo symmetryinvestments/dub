@@ -29,6 +29,7 @@ import std.datetime;
 import std.encoding : sanitize;
 import std.exception : enforce;
 import std.string;
+import std.typecons : Nullable;
 
 /**
 	Represents a full project, a root package with its dependencies and package
@@ -77,15 +78,11 @@ class Project {
 		m_packageManager = package_manager;
 		m_rootPackage = pack;
 
-		auto selverfile = (m_rootPackage.path ~ SelectedVersions.defaultFile).toNativeString();
-		if (existsFile(selverfile)) {
-			// TODO: Remove `StrictMode.Warn` after v1.40 release
-			// The default is to error, but as the previous parser wasn't
-			// complaining, we should first warn the user.
-			auto selected = parseConfigFileSimple!Selected(selverfile, StrictMode.Warn);
-			m_selections = !selected.isNull() ?
-				new SelectedVersions(selected.get()) : new SelectedVersions();
-		} else m_selections = new SelectedVersions;
+		NativePath absRootPackagePath = m_rootPackage.path;
+		auto lookupResult = lookupAndParseSelectionsFile(absRootPackagePath);
+		m_selections = lookupResult.isNull()
+			? new SelectedVersions
+			: lookupResult.get().selectedVersions;
 
 		reinit();
 	}
@@ -1750,6 +1747,23 @@ final class SelectedVersions {
 		m_bare = false;
 	}
 
+	/** Constructs a new non-empty version selection, prefixing relative path
+		selections with the specified prefix.
+
+		To be used in cases where the "dub.selections.json" file isn't located
+		in the root package directory.
+	*/
+	this(Selected data, NativePath relPathPrefix)
+	{
+		this(data);
+		if (relPathPrefix.empty) return;
+		foreach (ref dep; m_selections.versions.byValue) {
+			const depPath = dep.path;
+			if (!depPath.empty && !depPath.absolute)
+				dep = Dependency(relPathPrefix ~ depPath);
+		}
+	}
+
 	/// Returns a list of names for all packages that have a version selection.
 	@property string[] selectedPackages() const { return m_selections.versions.keys; }
 
@@ -1771,6 +1785,7 @@ final class SelectedVersions {
 	{
 		m_selections.fileVersion = versions.m_selections.fileVersion;
 		m_selections.versions = versions.m_selections.versions.dup;
+		m_selections.inheritable = versions.m_selections.inheritable;
 		m_dirty = true;
 	}
 
@@ -1852,7 +1867,7 @@ final class SelectedVersions {
 		auto result = appender!string();
 
 		assert(json.type == Json.Type.object);
-		assert(json.length == 2);
+		assert(json.length == 2 || json.length == 3);
 		assert(json["versions"].type != Json.Type.undefined);
 
 		result.put("{\n\t\"fileVersion\": ");
@@ -1868,7 +1883,10 @@ final class SelectedVersions {
 			result.put(": ");
 			result.writeJsonString(vers[k]);
 		}
-		result.put("\n\t}\n}\n");
+		result.put("\n\t}");
+		if (m_selections.inheritable)
+			result.put(",\n\tinheritable: true");
+		result.put("\n}\n");
 		path.writeFile(result.data);
 		m_dirty = false;
 		m_bare = false;
@@ -1901,6 +1919,8 @@ final class SelectedVersions {
 		serialized["versions"] = Json.emptyObject;
 		foreach (p, dep; m_selections.versions)
 			serialized["versions"][p] = dep.toJson(true);
+		if (m_selections.inheritable)
+			serialized["inheritable"] = true;
 		return serialized;
 	}
 
@@ -1914,6 +1934,8 @@ final class SelectedVersions {
 		scope(failure) clear();
 		foreach (string p, dep; json["versions"])
 			m_selections.versions[p] = dependencyFromJson(dep);
+		if (auto p = "inheritable" in json)
+			m_selections.inheritable = p.get!bool;
 	}
 }
 
@@ -1965,3 +1987,39 @@ private immutable DefaultTestRunnerCode = q{
 		}
 	}
 };
+
+
+struct SelverLookupResult {
+	NativePath absolutePath; // to dub.selections.json
+	SelectedVersions selectedVersions;
+}
+
+// Does both lookup *and* parsing because a parent dir's dub.selections.json
+// file is only inherited if it has `"inheritable": true` (=> needs parsing).
+Nullable!SelverLookupResult lookupAndParseSelectionsFile(NativePath absRootPackagePath)
+	in(absRootPackagePath.absolute)
+{
+	alias N = typeof(return);
+
+	// check for dub.selections.json in root package dir first, then walk up its
+	// parent directories
+	for (NativePath dir = absRootPackagePath; dir.hasParentPath; dir = dir.parentPath) {
+		const selverfile = dir ~ SelectedVersions.defaultFile;
+		if (existsFile(selverfile)) {
+			// TODO: Remove `StrictMode.Warn` after v1.40 release
+			// The default is to error, but as the previous parser wasn't
+			// complaining, we should first warn the user.
+			auto selected = parseConfigFileSimple!Selected(selverfile.toNativeString(), StrictMode.Warn);
+			const isValid = !selected.isNull() && (dir == absRootPackagePath || selected.get().inheritable);
+			if (isValid) {
+				return N(SelverLookupResult(
+					selverfile,
+					new SelectedVersions(selected.get(), dir.relativeTo(absRootPackagePath))
+				));
+			}
+			break;
+		}
+	}
+
+	return N.init;
+}
