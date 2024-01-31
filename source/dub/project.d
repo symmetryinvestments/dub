@@ -1885,7 +1885,7 @@ final class SelectedVersions {
 		}
 		result.put("\n\t}");
 		if (m_selections.inheritable)
-			result.put(",\n\tinheritable: true");
+			result.put(",\n\t\"inheritable\": true");
 		result.put("\n}\n");
 		path.writeFile(result.data);
 		m_dirty = false;
