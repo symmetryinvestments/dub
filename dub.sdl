@@ -7,8 +7,9 @@ license "MIT"
 
 targetPath "bin"
 
-dflags "-preview=in" platform="dmd"
-dflags "-preview=in" platform="ldc"
+# Symmetry: `-preview=in` causes CTFE errors when building the reggae unittests
+#dflags "-preview=in" platform="dmd"
+#dflags "-preview=in" platform="ldc"
 //Disabled due to ICEs in gdc.
 //dflags "-fpreview=in" platform="gdc"
 // Deprecated module(s)
