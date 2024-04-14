@@ -15,6 +15,7 @@ import dub.internal.vibecompat.inet.path;
 import dub.internal.logging;
 import dub.package_;
 import dub.recipe.io;
+import dub.recipe.selection;
 import dub.internal.configy.Exceptions;
 public import dub.internal.configy.Read : StrictMode;
 
@@ -380,7 +381,7 @@ class PackageManager {
 		StrictMode mode = StrictMode.Ignore)
 	{
 		if (recipe.empty)
-			recipe = Package.findPackageFile(path);
+			recipe = this.findPackageFile(path);
 
 		enforce(!recipe.empty,
 			"No package file found in %s, expected one of %s"
@@ -389,10 +390,30 @@ class PackageManager {
 
 		const PackageName pname = parent
 			? PackageName(parent.name) : PackageName.init;
-		auto content = readPackageRecipe(recipe, pname, mode);
+		string text = this.readText(recipe);
+		auto content = parsePackageRecipe(
+			text, recipe.toNativeString(), pname, null, mode);
 		auto ret = new Package(content, path, parent, version_);
 		ret.m_infoFile = recipe;
 		return ret;
+	}
+
+	/** Searches the given directory for package recipe files.
+	 *
+	 * Params:
+	 *   directory = The directory to search
+	 *
+	 * Returns:
+	 *   Returns the full path to the package file, if any was found.
+	 *   Otherwise returns an empty path.
+	 */
+	public NativePath findPackageFile(NativePath directory)
+	{
+		foreach (file; packageInfoFiles) {
+			auto filename = directory ~ file.filename;
+			if (this.existsFile(filename)) return filename;
+		}
+		return NativePath.init;
 	}
 
 	/** For a given SCM repository, returns the corresponding package.
@@ -419,12 +440,8 @@ class PackageManager {
 		final switch (repo.kind)
 		{
 			case repo.Kind.git:
-				pack = loadGitPackage(name, repo);
+				return this.loadGitPackage(name, repo);
 		}
-		if (pack !is null) {
-			addPackages(this.m_internal.fromPath, pack);
-		}
-		return pack;
 	}
 
 	deprecated("Use the overload that accepts a `dub.dependency : Repository`")
@@ -440,8 +457,6 @@ class PackageManager {
 
 	private Package loadGitPackage(in PackageName name, in Repository repo)
 	{
-		import dub.internal.git : cloneRepository;
-
 		if (!repo.ref_.startsWith("~") && !repo.ref_.isGitHash) {
 			return null;
 		}
@@ -455,11 +470,30 @@ class PackageManager {
 			}
 		}
 
-		if (!cloneRepository(repo.remote, gitReference, destination.toNativeString())) {
+		if (!this.gitClone(repo.remote, gitReference, destination))
 			return null;
-		}
 
-		return this.load(destination);
+		Package result = this.load(destination);
+		if (result !is null)
+			this.addPackages(this.m_internal.fromPath, result);
+		return result;
+	}
+
+	/**
+	 * Perform a `git clone` operation at `dest` using `repo`
+	 *
+	 * Params:
+	 *   remote = The remote to clone from
+	 *   gitref = The git reference to use
+	 *   dest   = Where the result of git clone operation is to be stored
+	 *
+	 * Returns:
+	 *	 Whether or not the clone operation was successfull.
+	 */
+	protected bool gitClone(string remote, string gitref, in NativePath dest)
+	{
+		static import dub.internal.git;
+		return dub.internal.git.cloneRepository(remote, gitref, dest.toNativeString());
 	}
 
 	/**
@@ -655,14 +689,14 @@ class PackageManager {
 	void addOverride(PlacementLocation scope_, string package_, Dependency version_spec, Version target)
 	{
 		m_repositories[scope_].overrides ~= PackageOverride(package_, version_spec, target);
-		m_repositories[scope_].writeOverrides();
+		m_repositories[scope_].writeOverrides(this);
 	}
 	/// ditto
 	deprecated("Use the overload that accepts a `VersionRange` as 3rd argument")
 	void addOverride(PlacementLocation scope_, string package_, Dependency version_spec, NativePath target)
 	{
 		m_repositories[scope_].overrides ~= PackageOverride(package_, version_spec, target);
-		m_repositories[scope_].writeOverrides();
+		m_repositories[scope_].writeOverrides(this);
 	}
 
 	/// Ditto
@@ -682,13 +716,13 @@ class PackageManager {
 	package(dub) void addOverride_(PlacementLocation scope_, string package_, VersionRange source, Version target)
 	{
 		m_repositories[scope_].overrides ~= PackageOverride_(package_, source, target);
-		m_repositories[scope_].writeOverrides();
+		m_repositories[scope_].writeOverrides(this);
 	}
 	// Non deprecated version that is used by `commandline`. Do not use!
 	package(dub) void addOverride_(PlacementLocation scope_, string package_, VersionRange source, NativePath target)
 	{
 		m_repositories[scope_].overrides ~= PackageOverride_(package_, source, target);
-		m_repositories[scope_].writeOverrides();
+		m_repositories[scope_].writeOverrides(this);
 	}
 
 	/** Removes an existing package override.
@@ -715,7 +749,7 @@ class PackageManager {
 			if (ovr.package_ != package_ || ovr.source != src)
 				continue;
 			rep.overrides = rep.overrides[0 .. i] ~ rep.overrides[i+1 .. $];
-			(*rep).writeOverrides();
+			(*rep).writeOverrides(this);
 			return;
 		}
 		throw new Exception(format("No override exists for %s %s", package_, src));
@@ -724,7 +758,9 @@ class PackageManager {
 	deprecated("Use `store(NativePath source, PlacementLocation dest, string name, Version vers)`")
 	Package storeFetchedPackage(NativePath zip_file_path, Json package_info, NativePath destination)
 	{
-		return this.store_(zip_file_path, destination,
+		import dub.internal.vibecompat.core.file;
+
+		return this.store_(readFile(zip_file_path), destination,
 			PackageName(package_info["name"].get!string),
 			Version(package_info["version"].get!string));
 	}
@@ -762,6 +798,16 @@ class PackageManager {
 	{
 		import dub.internal.vibecompat.core.file;
 
+		auto data = readFile(src);
+		return this.store(data, dest, name, vers);
+	}
+
+	/// Ditto
+	Package store(ubyte[] data, PlacementLocation dest,
+		in PackageName name, in Version vers)
+	{
+		import dub.internal.vibecompat.core.file;
+
 		assert(!name.sub.length, "Cannot store a subpackage, use main package instead");
 		NativePath dstpath = this.getPackagePath(dest, name, vers.toString());
 		ensureDirectory(dstpath.parentPath());
@@ -770,29 +816,28 @@ class PackageManager {
 		// possibly wait for other dub instance
 		import core.time : seconds;
 		auto lock = lockFile(lockPath.toNativeString(), 30.seconds);
-		if (dstpath.existsFile()) {
+		if (this.existsFile(dstpath)) {
 			return this.getPackage(name, vers, dest);
 		}
-		return this.store_(src, dstpath, name, vers);
+		return this.store_(data, dstpath, name, vers);
 	}
 
 	/// Backward-compatibility for deprecated overload, simplify once `storeFetchedPatch`
 	/// is removed
-	private Package store_(NativePath src, NativePath destination,
+	private Package store_(ubyte[] data, NativePath destination,
 		in PackageName name, in Version vers)
 	{
 		import dub.internal.vibecompat.core.file;
 		import std.range : walkLength;
 
-		logDebug("Placing package '%s' version '%s' to location '%s' from file '%s'",
-			name, vers, destination.toNativeString(), src.toNativeString());
+		logDebug("Placing package '%s' version '%s' to location '%s'",
+			name, vers, destination.toNativeString());
 
-		enforce(!existsFile(destination),
+		enforce(!this.existsFile(destination),
 			"%s (%s) needs to be removed from '%s' prior placement."
 			.format(name, vers, destination));
 
-		logDebug("Opening file %s", src);
-		ZipArchive archive = new ZipArchive(readFile(src));
+		ZipArchive archive = new ZipArchive(data);
 		logDebug("Extracting from zip.");
 
 		// In a GitHub zip, the actual contents are in a sub-folder
@@ -855,7 +900,7 @@ class PackageManager {
 					}
 				}
 
-				writeFile(dst_path, archive.expand(a));
+				this.writeFile(dst_path, archive.expand(a));
 				setAttributes(dst_path.toNativeString(), a);
 symlink_exit:
 				++countFiles;
@@ -945,7 +990,7 @@ symlink_exit:
 
 		addPackages(*packs, pack);
 
-		this.m_repositories[type].writeLocalPackageList();
+		this.m_repositories[type].writeLocalPackageList(this);
 
 		logInfo("Registered package: %s (version: %s)", pack.name, pack.version_);
 		return pack;
@@ -975,7 +1020,7 @@ symlink_exit:
 			.filter!(en => !to_remove.canFind(en.index))
 			.map!(en => en.value).array;
 
-		this.m_repositories[type].writeLocalPackageList();
+		this.m_repositories[type].writeLocalPackageList(this);
 
 		foreach(ver, name; removed)
 			logInfo("Deregistered package: %s (version: %s)", name, ver);
@@ -985,14 +1030,14 @@ symlink_exit:
 	void addSearchPath(NativePath path, PlacementLocation type)
 	{
 		m_repositories[type].searchPath ~= path;
-		this.m_repositories[type].writeLocalPackageList();
+		this.m_repositories[type].writeLocalPackageList(this);
 	}
 
 	/// Removes a search path from the given type.
 	void removeSearchPath(NativePath path, PlacementLocation type)
 	{
 		m_repositories[type].searchPath = m_repositories[type].searchPath.filter!(p => p != path)().array();
-		this.m_repositories[type].writeLocalPackageList();
+		this.m_repositories[type].writeLocalPackageList(this);
 	}
 
 	deprecated("Use `refresh()` without boolean argument(same as `refresh(false)`")
@@ -1021,7 +1066,7 @@ symlink_exit:
 			repository.scan(this, refresh);
 
 		foreach (ref repository; this.m_repositories)
-			repository.loadOverrides();
+			repository.loadOverrides(this);
 		this.m_initialized = true;
 	}
 
@@ -1058,6 +1103,71 @@ symlink_exit:
 		return digest[].dup;
 	}
 
+	/**
+	 * Writes the selections file (`dub.selections.json`)
+	 *
+	 * The selections file is only used for the root package / project.
+	 * However, due to it being a filesystem interaction, it is managed
+	 * from the `PackageManager`.
+	 *
+	 * Params:
+	 *   project = The root package / project to read the selections file for.
+	 *   selections = The `SelectionsFile` to write.
+	 *   overwrite = Whether to overwrite an existing selections file.
+	 *               True by default.
+	 */
+	public void writeSelections(in Package project, in Selections!1 selections,
+		bool overwrite = true)
+	{
+		const path = project.path ~ "dub.selections.json";
+		if (!overwrite && this.existsFile(path))
+			return;
+		this.writeFile(path, selectionsToString(selections));
+	}
+
+	/// Package function to avoid code duplication with deprecated
+	/// SelectedVersions.save, merge with `writeSelections` in
+	/// the future.
+	package static string selectionsToString (in Selections!1 s)
+	{
+		Json json = selectionsToJSON(s);
+		assert(json.type == Json.Type.object);
+		assert(json.length == 2 || json.length == 3);
+		assert(json["versions"].type != Json.Type.undefined);
+
+		auto result = appender!string();
+		result.put("{\n\t\"fileVersion\": ");
+		result.writeJsonString(json["fileVersion"]);
+		if (s.inheritable)
+			result.put(",\n\t\"inheritable\": true");
+		result.put(",\n\t\"versions\": {");
+		auto vers = json["versions"].get!(Json[string]);
+		bool first = true;
+		foreach (k; vers.byKey.array.sort()) {
+			if (!first) result.put(",");
+			else first = false;
+			result.put("\n\t\t");
+			result.writeJsonString(Json(k));
+			result.put(": ");
+			result.writeJsonString(vers[k]);
+		}
+		result.put("\n\t}\n}\n");
+		return result.data;
+	}
+
+	/// Ditto
+	package static Json selectionsToJSON (in Selections!1 s)
+	{
+		Json serialized = Json.emptyObject;
+		serialized["fileVersion"] = s.fileVersion;
+		if (s.inheritable)
+			serialized["inheritable"] = true;
+		serialized["versions"] = Json.emptyObject;
+		foreach (p, dep; s.versions)
+			serialized["versions"][p] = dep.toJson(true);
+		return serialized;
+	}
+
 	/// Adds the package and scans for sub-packages.
 	protected void addPackages(ref Package[] dst_repos, Package pack)
 	{
@@ -1089,11 +1199,46 @@ symlink_exit:
 		}
 	}
 
-	/// Used for dependency injection in `Location`
+	/// Used for dependency injection
 	protected bool existsDirectory(NativePath path)
 	{
 		static import dub.internal.vibecompat.core.file;
 		return dub.internal.vibecompat.core.file.existsDirectory(path);
+	}
+
+	/// Ditto
+	protected void ensureDirectory(NativePath path)
+	{
+		static import dub.internal.vibecompat.core.file;
+		return dub.internal.vibecompat.core.file.ensureDirectory(path);
+	}
+
+	/// Ditto
+	protected bool existsFile(NativePath path)
+	{
+		static import dub.internal.vibecompat.core.file;
+		return dub.internal.vibecompat.core.file.existsFile(path);
+	}
+
+	/// Ditto
+	protected void writeFile(NativePath path, const(ubyte)[] data)
+	{
+		static import dub.internal.vibecompat.core.file;
+		return dub.internal.vibecompat.core.file.writeFile(path, data);
+	}
+
+	/// Ditto
+	protected void writeFile(NativePath path, const(char)[] data)
+	{
+		static import dub.internal.vibecompat.core.file;
+		return dub.internal.vibecompat.core.file.writeFile(path, data);
+	}
+
+	/// Ditto
+	protected string readText(NativePath path)
+	{
+		static import dub.internal.vibecompat.core.file;
+		return dub.internal.vibecompat.core.file.readText(path);
 	}
 
 	/// Ditto
@@ -1244,17 +1389,17 @@ package struct Location {
 		this.packagePath = path;
 	}
 
-	void loadOverrides()
+	void loadOverrides(PackageManager mgr)
 	{
-		import dub.internal.vibecompat.core.file;
-
 		this.overrides = null;
 		auto ovrfilepath = this.packagePath ~ LocalOverridesFilename;
-		if (existsFile(ovrfilepath)) {
+		if (mgr.existsFile(ovrfilepath)) {
 			logWarn("Found local override file: %s", ovrfilepath);
 			logWarn(OverrideDepMsg);
 			logWarn("Replace with a path-based dependency in your project or a custom cache path");
-			foreach (entry; jsonFromFile(ovrfilepath)) {
+			const text = mgr.readText(ovrfilepath);
+			auto json = parseJsonString(text, ovrfilepath.toNativeString());
+			foreach (entry; json) {
 				PackageOverride_ ovr;
 				ovr.package_ = entry["name"].get!string;
 				ovr.source = VersionRange.fromString(entry["version"].get!string);
@@ -1265,10 +1410,8 @@ package struct Location {
 		}
 	}
 
-	private void writeOverrides()
+	private void writeOverrides(PackageManager mgr)
 	{
-		import dub.internal.vibecompat.core.file;
-
 		Json[] newlist;
 		foreach (ovr; this.overrides) {
 			auto jovr = Json.emptyObject;
@@ -1281,14 +1424,14 @@ package struct Location {
 			newlist ~= jovr;
 		}
 		auto path = this.packagePath;
-		ensureDirectory(path);
-		writeJsonFile(path ~ LocalOverridesFilename, Json(newlist));
+		mgr.ensureDirectory(path);
+		auto app = appender!string();
+		app.writePrettyJsonString(Json(newlist));
+		mgr.writeFile(path ~ LocalOverridesFilename, app.data);
 	}
 
-	private void writeLocalPackageList()
+	private void writeLocalPackageList(PackageManager mgr)
 	{
-		import dub.internal.vibecompat.core.file;
-
 		Json[] newlist;
 		foreach (p; this.searchPath) {
 			auto entry = Json.emptyObject;
@@ -1307,24 +1450,26 @@ package struct Location {
 		}
 
 		NativePath path = this.packagePath;
-		ensureDirectory(path);
-		writeJsonFile(path ~ LocalPackagesFilename, Json(newlist));
+		mgr.ensureDirectory(path);
+		auto app = appender!string();
+		app.writePrettyJsonString(Json(newlist));
+		mgr.writeFile(path ~ LocalPackagesFilename, app.data);
 	}
 
 	// load locally defined packages
 	void scanLocalPackages(bool refresh, PackageManager manager)
 	{
-		import dub.internal.vibecompat.core.file;
-
 		NativePath list_path = this.packagePath;
 		Package[] packs;
 		NativePath[] paths;
 		try {
 			auto local_package_file = list_path ~ LocalPackagesFilename;
-			if (!existsFile(local_package_file)) return;
+			if (!manager.existsFile(local_package_file)) return;
 
 			logDiagnostic("Loading local package map at %s", local_package_file.toNativeString());
-			auto packlist = jsonFromFile(local_package_file);
+			const text = manager.readText(local_package_file);
+			auto packlist = parseJsonString(
+				text, local_package_file.toNativeString());
 			enforce(packlist.type == Json.Type.array, LocalPackagesFilename ~ " must contain an array.");
 			foreach (pentry; packlist) {
 				try {
@@ -1345,7 +1490,7 @@ package struct Location {
 						}
 
 						if (!pp) {
-							auto infoFile = Package.findPackageFile(path);
+							auto infoFile = manager.findPackageFile(path);
 							if (!infoFile.empty) pp = manager.load(path, infoFile);
 							else {
 								logWarn("Locally registered package %s %s was not found. Please run 'dub remove-local \"%s\"'.",
@@ -1402,15 +1547,15 @@ package struct Location {
 
 		void loadInternal (NativePath pack_path, NativePath packageFile)
 		{
-			Package p;
+			import std.algorithm.searching : find;
+
+			// If the package has already been loaded, no need to re-load it.
+			auto rng = existing_packages.find!(pp => pp.path == pack_path);
+			if (!rng.empty)
+				return mgr.addPackages(this.fromPath, rng.front);
+
 			try {
-				foreach (pp; existing_packages)
-					if (pp.path == pack_path) {
-						p = pp;
-						break;
-					}
-				if (!p) p = mgr.load(pack_path, packageFile);
-				mgr.addPackages(this.fromPath, p);
+				mgr.addPackages(this.fromPath, mgr.load(pack_path, packageFile));
 			} catch (ConfigException exc) {
 				// Configy error message already include the path
 				logError("Invalid recipe for local package: %S", exc);
@@ -1425,30 +1570,41 @@ package struct Location {
 			logDebug("iterating dir %s entry %s", path.toNativeString(), pdir.name);
 			if (!pdir.isDirectory) continue;
 
-			// Old / flat directory structure, used in non-standard path
-			// Packages are stored in $ROOT/$SOMETHING/`
 			const pack_path = path ~ (pdir.name ~ "/");
-			auto packageFile = Package.findPackageFile(pack_path);
-			if (!packageFile.empty) {
-				// Deprecated unmanaged directory structure
-				logWarn("Package at path '%s' should be under '%s'",
-						pack_path.toNativeString().color(Mode.bold),
-						(pack_path ~ "$VERSION" ~ pdir.name).toNativeString().color(Mode.bold));
-				logWarn("The package will no longer be detected starting from v1.42.0");
-				loadInternal(pack_path, packageFile);
-			}
+			auto packageFile = mgr.findPackageFile(pack_path);
 
-			// Managed structure: $ROOT/$NAME/$VERSION/$NAME
-			// This is the most common code path
-			else {
-				// Iterate over versions of a package
-				foreach (versdir; mgr.iterateDirectory(pack_path)) {
-					if (!versdir.isDirectory) continue;
-					auto vers_path = pack_path ~ versdir.name ~ (pdir.name ~ "/");
-					if (!mgr.existsDirectory(vers_path)) continue;
-					packageFile = Package.findPackageFile(vers_path);
-					loadInternal(vers_path, packageFile);
+			if (isManaged(path)) {
+				// Old / flat directory structure, used in non-standard path
+				// Packages are stored in $ROOT/$SOMETHING/`
+				if (!packageFile.empty) {
+					// Deprecated flat managed directory structure
+					logWarn("Package at path '%s' should be under '%s'",
+							pack_path.toNativeString().color(Mode.bold),
+							(pack_path ~ "$VERSION" ~ pdir.name).toNativeString().color(Mode.bold));
+					logWarn("The package will no longer be detected starting from v1.42.0");
+					loadInternal(pack_path, packageFile);
+				} else {
+					// New managed structure: $ROOT/$NAME/$VERSION/$NAME
+					// This is the most common code path
+
+					// Iterate over versions of a package
+					foreach (versdir; mgr.iterateDirectory(pack_path)) {
+						if (!versdir.isDirectory) continue;
+						auto vers_path = pack_path ~ versdir.name ~ (pdir.name ~ "/");
+						if (!mgr.existsDirectory(vers_path)) continue;
+						packageFile = mgr.findPackageFile(vers_path);
+						loadInternal(vers_path, packageFile);
+					}
 				}
+			} else {
+				// Unmanaged directories (dub add-path) are always stored as a
+				// flat list of packages, as these are the working copies managed
+				// by the user. The nested structure should not be supported,
+				// even optionally, because that would lead to bogus "no package
+				// file found" errors in case the internal directory structure
+				// accidentally matches the $NAME/$VERSION/$NAME scheme
+				if (!packageFile.empty)
+					loadInternal(pack_path, packageFile);
 			}
 		}
 		catch (Exception e)
