@@ -1134,12 +1134,14 @@ symlink_exit:
 	{
 		Json json = selectionsToJSON(s);
 		assert(json.type == Json.Type.object);
-		assert(json.length == 2);
+		assert(json.length == 2 || json.length == 3);
 		assert(json["versions"].type != Json.Type.undefined);
 
 		auto result = appender!string();
 		result.put("{\n\t\"fileVersion\": ");
 		result.writeJsonString(json["fileVersion"]);
+		if (s.inheritable)
+			result.put(",\n\t\"inheritable\": true");
 		result.put(",\n\t\"versions\": {");
 		auto vers = json["versions"].get!(Json[string]);
 		bool first = true;
@@ -1160,6 +1162,8 @@ symlink_exit:
 	{
 		Json serialized = Json.emptyObject;
 		serialized["fileVersion"] = s.fileVersion;
+		if (s.inheritable)
+			serialized["inheritable"] = true;
 		serialized["versions"] = Json.emptyObject;
 		foreach (p, dep; s.versions)
 			serialized["versions"][p] = dep.toJson(true);
